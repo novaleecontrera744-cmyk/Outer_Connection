@@ -22,6 +22,9 @@ class FakeSystemd:
             return SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    def json(self, args):
+        return {"nftables": []}
+
 
 class RepeatedLifecycleTests(unittest.TestCase):
     def setUp(self):
