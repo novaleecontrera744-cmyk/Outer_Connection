@@ -28,6 +28,9 @@ class RecordingRunner:
             out = json.dumps([{"dev": self.route_dev}])
         return subprocess.CompletedProcess(args, 0, out, "")
 
+    def json(self, args):
+        return {"nftables": []}
+
 
 class RouteSafetyTests(unittest.TestCase):
     def test_wireguard_peer_requires_allowlisted_address_and_marked_veth_route(self):
