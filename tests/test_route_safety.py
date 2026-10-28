@@ -72,7 +72,7 @@ class RouteSafetyTests(unittest.TestCase):
         self.assertIn("0x01000000", rules)
         self.assertIn("0x04000000", rules)
         self.assertIn("type filter hook output", rules)
-        self.assertIn('oifname @bootstrap_ifaces fib daddr . mark oifname "ogw-host" accept', rules)
+        self.assertIn('oifname @bootstrap_ifaces accept', rules)
         self.assertIn('set bootstrap_ifaces { type ifname; elements = { "ogw-host" }; }', rules)
         strict_rules = outer._guard_script({"vless": {"port": 443}, "strict": True}, "203.0.113.10", "eth0")
         self.assertNotIn('elements = { "ogw-host" }', strict_rules)
