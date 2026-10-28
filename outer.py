@@ -127,6 +127,7 @@ SYSTEM_TOOLS = {
     "wg": ("/usr/bin/wg", "/usr/sbin/wg", "/bin/wg", "/sbin/wg"),
     "systemctl": ("/usr/bin/systemctl", "/bin/systemctl"),
     "resolvectl": ("/usr/bin/resolvectl", "/bin/resolvectl"),
+    "unshare": ("/usr/bin/unshare", "/bin/unshare", "/usr/sbin/unshare", "/sbin/unshare"),
 }
 
 
@@ -151,6 +152,10 @@ def command_argv(args):
         if len(command) < 5:
             raise OuterError("An incomplete namespace command was rejected.")
         command[4] = executable_path(command[4])
+    if Path(command[0]).name == "unshare" and command[1:3] == ["--net", "--"]:
+        if len(command) < 4:
+            raise OuterError("An incomplete namespace command was rejected.")
+        command[3] = executable_path(command[3])
     return command
 
 
@@ -1513,7 +1518,7 @@ def _guard_script(settings, server, physical):
     meta nfproto ipv6 counter drop
     oifname @proton_ifaces accept
     oifname "{HOST_IF}" ip daddr . udp dport @proton_peers @th,64,32 {{ 0x01000000, 0x02000000, 0x03000000, 0x04000000 }} accept
-    oifname @bootstrap_ifaces fib daddr . mark oifname "{HOST_IF}" accept
+    oifname @bootstrap_ifaces accept
     counter drop
   }}
   chain forward {{
