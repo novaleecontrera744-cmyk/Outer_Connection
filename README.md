@@ -26,14 +26,14 @@ Use a local console/TTY and keep a recovery path available before starting: the 
 ## Requirements
 
 - Lubuntu/Linux with Python 3.9 or newer, systemd, and an available `/dev/net/tun` device.
-- Required tools: `ip` from `iproute2`, `nft` from `nftables`, `systemctl`, active `systemd-resolved`/`resolvectl`, `wg` from `wireguard-tools`, and `sysctl` (normally provided by `procps`). The installer uses Python's standard-library HTTPS client; no `curl` or Python package is required.
+- Required tools: `ip` from `iproute2`, `nft` from `nftables`, `unshare` from `util-linux`, `systemctl`, active `systemd-resolved`/`resolvectl`, `wg` from `wireguard-tools`, and `sysctl` (normally provided by `procps`). The installer uses Python's standard-library HTTPS client; no `curl` or Python package is required.
 - sing-box **1.14.4** and Xray **26.10.21** are installed by the script when needed. Release downloads support Linux x86-64 and ARM64 only.
 - Root privileges for `install`, `apply`, `start`, `stop`, and `uninstall`. `preflight`, `dry-run`, and `status` do not require root; run `status` with `sudo` to inspect protected recovery state.
 
 On Lubuntu, install missing tools and ensure resolved is running, for example:
 
 ```sh
-sudo apt install python3 iproute2 nftables systemd-resolved wireguard-tools procps
+sudo apt install python3 iproute2 nftables util-linux systemd-resolved wireguard-tools procps
 sudo systemctl enable --now systemd-resolved.service
 ```
 
@@ -101,7 +101,7 @@ After updating an existing checkout, stop the gateway and run `sudo python3 oute
 
 `apply` validates the generated configs with the installed real binaries and copies `.env` into the root-only configuration path. `start` launches the single supervisor, which checks the outer connection before changing the host default route. Connect Proton only after `start` succeeds. With the default mode, websites and services can see the outer IP until Proton connects. Changing `.env` requires stopping first, applying the new file, then starting again; `apply` refuses to change a running configuration.
 
-Before installing files or changing networking, `install` and `start` check the generated nftables scripts with `nft -c`. Validation uses the actual route-selected interface and exercises transition, guard/NAT, peer-update and cleanup commands without committing them. It requires root/kernel access. On failure no gateway networking is changed; the existing connection, including any ordinary direct connection, remains as it was. The checks cover `outer.py`'s own nft scripts, not rules sing-box creates internally. A successful check is not proof of a working connection. System utilities, including nft and sysctl, are invoked by absolute path rather than the caller's `PATH`. External-command failures include redacted argv and stderr in the error and system journal; failures after a recovery journal is created are also recorded there. Review diagnostics for local addresses before sharing them.
+Before installing files or changing gateway networking, `install` and `start` check the generated nftables scripts with `nft -c`, then commit inert copies in a new temporary network namespace to exercise kernel hook validation. The probe uses unique temporary tables, retains the rule expressions and hooks, makes verdicts harmless, and deletes its tables before the namespace exits. Existing host traffic and firewall tables are not touched. The check requires root and permission to create a network namespace; failure leaves the existing connection, including any direct connection, as it was. It covers `outer.py`'s rules, not rules sing-box creates internally, and is not proof of a working tunnel. System utilities, including nft and sysctl, are invoked by absolute path rather than the caller's `PATH`. External-command failures include redacted argv and stderr in the error and system journal; failures after a recovery journal is created are also recorded there. Review diagnostics for local addresses before sharing them.
 
 ## Legacy migration and backups
 
