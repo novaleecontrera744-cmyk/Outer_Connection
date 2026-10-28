@@ -105,7 +105,7 @@ def _mutates_network(call):
 
 @contextlib.contextmanager
 def _fake_system_binaries():
-    names = ("ip", "nft", "sysctl", "wg", "systemctl", "resolvectl")
+    names = ("ip", "nft", "sysctl", "wg", "systemctl", "resolvectl", "unshare")
     with tempfile.TemporaryDirectory(prefix="outer-fake-tools-") as temporary:
         mapping = {}
         for name in names:
@@ -375,7 +375,9 @@ class DebugRulesTests(unittest.TestCase):
                     nft_commands.append(argv)
             self.assertEqual(sum("-c" in argv for argv in nft_commands), len(plan["checks"]))
             self.assertEqual(sum("-f" in argv and "-c" not in argv for argv in nft_commands),
-                             2 + len(plan["updates"]))
+                             3 + 2 * len(plan["updates"]))
+            self.assertIn("--net --", output)
+            self.assertIn("Kernel preflight: temporary setup", output)
             self.assertNotIn(TEST_UUID, output)
             self.assertNotIn(TEST_PUBLIC_KEY, output)
             self.assertNotIn(TEST_VLESS_URL, output)
