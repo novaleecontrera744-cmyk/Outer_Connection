@@ -280,27 +280,31 @@ class InstallationAndApplyTests(IsolatedRuntimeTest):
 
 
 class EarlyStartFailureTests(IsolatedRuntimeTest):
-    def test_preparation_failure_installs_a_guard_before_returning(self):
+    def test_preparation_failure_leaves_network_untouched(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = outer.Paths(Path(temporary))
             runner = FakeRunner()
             with mock.patch.object(outer, "systemd_active", return_value=False), \
                  mock.patch.object(outer, "dependencies_ok", side_effect=outer.OuterError("unavailable")):
-                with self.assertRaisesRegex(outer.OuterError, "direct traffic is blocked"):
+                with self.assertRaisesRegex(outer.OuterError, "unavailable"):
                     outer.start(paths, runner)
-            state = outer.load_state(paths)
-            self.assertEqual(state["phase"], "failed-guarded")
-            self.assertTrue(any(item["protected"] for item in state["undo"]))
-            self.assertTrue(any(args == ["nft", "-f", "-"] for args in runner.commands))
+            self.assertIsNone(outer.load_state(paths))
+            self.assertEqual(runner.commands, [])
 
-    def test_reports_when_guard_cannot_be_installed(self):
+    def test_nft_prevalidation_failure_does_not_install_guard(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = outer.Paths(Path(temporary))
-            runner = FakeRunner(failures=[["nft", "-f", "-"]])
+            runner = FakeRunner()
             with mock.patch.object(outer, "systemd_active", return_value=False), \
-                 mock.patch.object(outer, "dependencies_ok", side_effect=outer.OuterError("unavailable")):
-                with self.assertRaisesRegex(outer.OuterError, "disconnect the network"):
+                 mock.patch.object(outer, "dependencies_ok"), \
+                 mock.patch.object(outer, "read_settings_and_data", return_value=({}, ENV_TEXT.encode())), \
+                 mock.patch.object(outer, "checked_server", return_value=TEST_SERVER_IPV4), \
+                 mock.patch.object(outer, "validate_configs"), \
+                 mock.patch.object(outer, "prepare_nft_rules", side_effect=outer.OuterError("nft pre-validation failed")):
+                with self.assertRaisesRegex(outer.OuterError, "nft pre-validation failed"):
                     outer.start(paths, runner)
+            self.assertIsNone(outer.load_state(paths))
+            self.assertNotIn(["nft", "-f", "-"], runner.commands)
 
 
 class JournalCleanupTests(IsolatedRuntimeTest):
@@ -344,7 +348,7 @@ class JournalCleanupTests(IsolatedRuntimeTest):
             }
             runner = FakeRunner(failures=[failed_undo])
 
-            with self.assertRaisesRegex(outer.OuterError, "traffic guard remains"):
+            with self.assertRaisesRegex(outer.OuterError, "Cleanup was incomplete"):
                 outer.cleanup(state, paths=paths, runner=runner)
 
             self.assertEqual(state["phase"], "cleanup-incomplete")
@@ -376,6 +380,7 @@ class MigrationTests(IsolatedRuntimeTest):
                 ),
                 mock.patch.object(outer, "checked_server", return_value=TEST_SERVER_IPV4),
                 mock.patch.object(outer, "validate_configs"),
+                mock.patch.object(outer, "prepare_nft_rules", return_value="wlp5s0"),
                 mock.patch.object(outer, "legacy_paths", return_value=[legacy_unit]),
             ):
                 with self.assertRaisesRegex(outer.OuterError, "previous legacy gateway was restored"):
