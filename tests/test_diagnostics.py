@@ -105,7 +105,7 @@ def _mutates_network(call):
 
 @contextlib.contextmanager
 def _fake_system_binaries():
-    names = ("ip", "nft", "sysctl", "wg", "systemctl", "resolvectl")
+    names = ("ip", "nft", "sysctl", "wg", "systemctl", "resolvectl", "unshare")
     with tempfile.TemporaryDirectory(prefix="outer-fake-tools-") as temporary:
         mapping = {}
         for name in names:
@@ -228,6 +228,18 @@ class IsolatedLifecycleTests(unittest.TestCase):
             "a failed nft -c must leave networking untouched",
         )
         self.assertFalse(self.paths.state.exists(), "validation failure must not leave a recovery journal")
+        self._stop_twice(runner)
+
+    def test_kernel_preflight_failure_aborts_before_gateway_changes(self):
+        runner = RecordingRunner(
+            fail_when=lambda command, script: _tool(command) == "unshare",
+            failure_stderr="Operation not supported",
+        )
+        with self.assertRaisesRegex(outer.OuterError, "Operation not supported"):
+            self._start(runner)
+        self.assertTrue(any(_tool(call["args"]) == "unshare" for call in runner.calls))
+        self.assertFalse(any(_mutates_network(call) for call in runner.calls))
+        self.assertFalse(self.paths.state.exists())
         self._stop_twice(runner)
 
     def test_every_nft_script_is_checked_before_the_first_install(self):
@@ -375,7 +387,9 @@ class DebugRulesTests(unittest.TestCase):
                     nft_commands.append(argv)
             self.assertEqual(sum("-c" in argv for argv in nft_commands), len(plan["checks"]))
             self.assertEqual(sum("-f" in argv and "-c" not in argv for argv in nft_commands),
-                             2 + len(plan["updates"]))
+                             3 + 2 * len(plan["updates"]))
+            self.assertIn("--net --", output)
+            self.assertIn("Kernel preflight: temporary setup", output)
             self.assertNotIn(TEST_UUID, output)
             self.assertNotIn(TEST_PUBLIC_KEY, output)
             self.assertNotIn(TEST_VLESS_URL, output)
