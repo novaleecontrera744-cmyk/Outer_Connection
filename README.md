@@ -75,6 +75,7 @@ Run commands from the repository directory. `preflight` and `dry-run` read the l
 # Unprivileged checks
 python3 outer.py preflight --env .env
 python3 outer.py dry-run --env .env
+python3 outer.py debug-rules --env .env
 
 # Root-required installation and configuration
 sudo python3 outer.py install
@@ -94,7 +95,11 @@ sudo python3 outer.py uninstall
 
 `install` installs the unit and script but does not enable the service for boot or start it. If pinned binaries are absent or fail integrity checks, it asks before downloading official sing-box 1.14.4 and Xray 26.10.21 releases. It checks GitHub's official release metadata, exact asset URLs, and SHA-256 digests before installing. Answer `y`/`yes` to confirm; `sudo python3 outer.py install --yes` skips the prompt and explicitly authorizes the download. A current, verified installation does not download again. No tests download binaries.
 
+`debug-rules` prints the nftables scripts and every nft command that `start` would run, including the detected physical interface. It is for inspection; it does not install the rules or change routes. Review the output before sharing it because interface names and network addresses are local details.
+
 `apply` validates the generated configs with the installed real binaries and copies `.env` into the root-only configuration path. `start` launches the single supervisor, which checks the outer connection before changing the host default route. Connect Proton only after `start` succeeds. With the default mode, websites and services can see the outer IP until Proton connects. Changing `.env` requires stopping first, applying the new file, then starting again; `apply` refuses to change a running configuration.
+
+Before changing networking or applying any nftables rules, `start` checks every generated nftables script with `nft -c`; a validation failure aborts before network changes. System utilities, including nft and sysctl, are invoked by absolute executable path rather than resolved through the caller's `PATH`. When an external command fails, the `OuterError` and recovery journal include its argv and stderr with sensitive values redacted. Review diagnostics for local interface or address information before sharing them.
 
 ## Legacy migration and backups
 
@@ -147,6 +152,8 @@ sudo python3 outer.py stop
 ```
 
 `stop` is the supported recovery path and is safe to retry. If legacy migration was interrupted before the new service became ready, it restores the saved legacy files and service state before releasing the guard; completed migrations are not undone. Do not flush nftables, delete routes, or remove the namespace manually while a recovery journal remains; that can defeat the guard. If `stop` still fails, preserve the guard and backups, correct the underlying service/tool problem, and retry from a local console. Once stop/uninstall completes, the guard is gone and ordinary host routing is restored; applications may then use the regular, non-Proton route.
+
+After any failed `start`, run `sudo python3 outer.py status` to inspect the journal and recorded guard state, then `sudo python3 outer.py stop` to unwind partial setup and restore regular host routing. Check `status` again after cleanup; restored Internet access may use the ordinary, non-Proton route and expose the normal public IP. Do not treat successful `nft -c` validation as proof that a later nft command, rollback, or networking operation will succeed. Runtime behavior on the reported laptop with nftables 1.1.6 has not been verified. Test only from a local console or TTY—not over SSH—with network-using apps closed, Proton disconnected, and the recovery command ready; never start remotely when losing the route would lock you out.
 
 ## Tests
 
