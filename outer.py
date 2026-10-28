@@ -127,6 +127,7 @@ SYSTEM_TOOLS = {
     "wg": ("/usr/bin/wg", "/usr/sbin/wg", "/bin/wg", "/sbin/wg"),
     "systemctl": ("/usr/bin/systemctl", "/bin/systemctl"),
     "resolvectl": ("/usr/bin/resolvectl", "/bin/resolvectl"),
+    "unshare": ("/usr/bin/unshare", "/bin/unshare", "/usr/sbin/unshare", "/sbin/unshare"),
 }
 
 
@@ -151,6 +152,10 @@ def command_argv(args):
         if len(command) < 5:
             raise OuterError("An incomplete namespace command was rejected.")
         command[4] = executable_path(command[4])
+    if Path(command[0]).name == "unshare" and command[1:3] == ["--net", "--"]:
+        if len(command) < 4:
+            raise OuterError("An incomplete namespace command was rejected.")
+        command[3] = executable_path(command[3])
     return command
 
 
@@ -1513,7 +1518,7 @@ def _guard_script(settings, server, physical):
     meta nfproto ipv6 counter drop
     oifname @proton_ifaces accept
     oifname "{HOST_IF}" ip daddr . udp dport @proton_peers @th,64,32 {{ 0x01000000, 0x02000000, 0x03000000, 0x04000000 }} accept
-    oifname @bootstrap_ifaces fib daddr . mark oifname "{HOST_IF}" accept
+    oifname @bootstrap_ifaces accept
     counter drop
   }}
   chain forward {{
@@ -1564,12 +1569,96 @@ def nft_rule_plan(settings, server, physical):
     return {"checks": checks, "transition": _transition_script(), "guard": guard, "updates": updates}
 
 
+def _inert_nft_script(script, names):
+    for original, replacement in names.items():
+        script = re.sub(r"\b" + re.escape(original) + r"\b", replacement, script)
+    lines = []
+    in_chain = False
+    for line in script.splitlines():
+        stripped = line.strip()
+        if line.startswith("  chain ") and stripped.endswith("{"):
+            in_chain = True
+        elif in_chain and line == "  }":
+            in_chain = False
+        elif in_chain and stripped:
+            if stripped.startswith("type "):
+                if "policy accept;" not in stripped:
+                    raise OuterError("The nft preflight requires an accept chain policy.")
+            else:
+                # Both comparisons inspect the same packet mark, so no probe rule can match.
+                rule = re.sub(r"\bdrop$", "accept", stripped)
+                line = "    meta mark 0x0 meta mark != 0x0 " + rule
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def nft_kernel_plan(settings, server, physical, token):
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise OuterError("The nft preflight table identifier is invalid.")
+    names = {"outer_vpn_transition": f"ogw_probe_t_{token}",
+             "outer_vpn_guard": f"ogw_probe_g_{token}",
+             "outer_vpn_nat": f"ogw_probe_n_{token}"}
+    base = nft_rule_plan(settings, server, physical)
+    setup = _inert_nft_script(base["transition"], names) + _inert_nft_script(base["guard"], names)
+    updates = [(label, _inert_nft_script(script, names)) for label, script in base["updates"]]
+    tables = [("inet", names["outer_vpn_transition"]), ("inet", names["outer_vpn_guard"]),
+              ("ip", names["outer_vpn_nat"])]
+    return {"setup": setup, "updates": updates, "tables": tables}
+
+
+def run_nft_kernel_probe(plan, runner=RUNNER):
+    failure = None
+    cleanup_errors = []
+    try:
+        runner.run(["nft", "-f", "-"], input_text=plan["setup"])
+        for label, script in plan["updates"]:
+            try:
+                runner.run(["nft", "-f", "-"], input_text=script)
+            except OuterError as exc:
+                raise OuterError(f"nft kernel preflight failed for {label}:\n{exc}") from exc
+    except BaseException as exc:
+        failure = exc
+    finally:
+        for family, name in reversed(plan["tables"]):
+            command = ["nft", "delete", "table", family, name]
+            try:
+                result = runner.run(command, check=False)
+                if result.returncode and not _already_absent(result):
+                    cleanup_errors.append(str(command_failure(getattr(result, "args", command), result.returncode,
+                                                              result.stderr, secrets=getattr(runner, "secrets", ()))))
+            except (OuterError, OSError) as exc:
+                cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        message = "Could not remove an nft preflight table:\n" + "\n".join(cleanup_errors)
+        if failure:
+            message = str(failure) + "\n" + message
+        raise OuterError(message) from failure
+    if failure:
+        raise failure
+
+
+def _require_new_network_namespace():
+    try:
+        current = os.stat("/proc/self/ns/net")
+        parent = os.stat(f"/proc/{os.getppid()}/ns/net")
+    except OSError as exc:
+        raise OuterError("Could not verify the isolated nft preflight namespace.") from exc
+    if (current.st_dev, current.st_ino) == (parent.st_dev, parent.st_ino):
+        raise OuterError("The nft kernel preflight must run in a new network namespace.")
+
+
 def validate_nft_rules(settings, server, physical, runner=RUNNER):
     for label, script in nft_rule_plan(settings, server, physical)["checks"]:
         try:
             runner.run(["nft", "-c", "-f", "-"], input_text=script)
         except OuterError as exc:
             raise OuterError(f"nft pre-validation failed for {label}:\n{exc}") from exc
+    plan = nft_kernel_plan(settings, server, physical, uuid.uuid4().hex)
+    command = ["unshare", "--net", "--", sys.executable, str(Path(__file__).resolve()), "_nft-kernel-probe"]
+    try:
+        runner.run(command, input_text=json.dumps(plan), timeout=90)
+    except OuterError as exc:
+        raise OuterError(f"nft kernel preflight failed:\n{exc}") from exc
 
 
 def prepare_nft_rules(settings, server, runner=RUNNER):
@@ -1604,6 +1693,15 @@ def debug_rules(env_path, runner=RUNNER):
     for label, script in plan["checks"]:
         print(f"\n# Read-only validation: {label}\n" + shlex.join([nft, "-c", "-f", "-"]))
         print(script, end="" if script.endswith("\n") else "\n")
+    probe = nft_kernel_plan(settings, server, physical, uuid.uuid4().hex)
+    unshare = executable_path("unshare")
+    print("\n# Kernel preflight runs in a new network namespace; table names are examples")
+    print(shlex.join([unshare, "--net", "--", sys.executable, str(Path(__file__).resolve()), "_nft-kernel-probe"]))
+    for label, script in [("temporary setup", probe["setup"]), *probe["updates"]]:
+        print(f"\n# Kernel preflight: {label}\n" + shlex.join([nft, "-f", "-"]))
+        print(script, end="" if script.endswith("\n") else "\n")
+    for family, name in reversed(probe["tables"]):
+        print("\n# Delete temporary preflight table\n" + shlex.join([nft, "delete", "table", family, name]))
     for label, script in [("transition", plan["transition"]), ("guard and NAT", plan["guard"]), *plan["updates"]]:
         print(f"\n# Apply: {label}\n" + shlex.join([nft, "-f", "-"]))
         print(script, end="" if script.endswith("\n") else "\n")
@@ -2321,7 +2419,7 @@ def main(argv=None):
     install_parser = sub.add_parser("install")
     install_parser.add_argument("--yes", action="store_true", help="confirm official release downloads")
     install_parser.add_argument("--env", default=".env", help="data-only configuration file (default: .env)")
-    for command in ("start", "stop", "status", "uninstall", "_supervise", "_post-stop", "_socks-ready"):
+    for command in ("start", "stop", "status", "uninstall", "_supervise", "_post-stop", "_socks-ready", "_nft-kernel-probe"):
         sub.add_parser(command, help=argparse.SUPPRESS if command.startswith("_") else None)
     probe = sub.add_parser("_probe", help=argparse.SUPPRESS)
     probe.add_argument("dns")
@@ -2337,6 +2435,10 @@ def main(argv=None):
             probe_tunnel(args.dns)
         elif args.command == "_socks-ready":
             return 0 if socks_ready() else 1
+        elif args.command == "_nft-kernel-probe":
+            require_root()
+            _require_new_network_namespace()
+            run_nft_kernel_probe(json.load(sys.stdin))
         elif args.command == "_supervise":
             return supervise()
         elif args.command == "_post-stop":

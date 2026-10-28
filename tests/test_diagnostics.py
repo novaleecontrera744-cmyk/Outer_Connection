@@ -105,7 +105,7 @@ def _mutates_network(call):
 
 @contextlib.contextmanager
 def _fake_system_binaries():
-    names = ("ip", "nft", "sysctl", "wg", "systemctl", "resolvectl")
+    names = ("ip", "nft", "sysctl", "wg", "systemctl", "resolvectl", "unshare")
     with tempfile.TemporaryDirectory(prefix="outer-fake-tools-") as temporary:
         mapping = {}
         for name in names:
