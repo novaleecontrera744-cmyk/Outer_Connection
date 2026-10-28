@@ -20,8 +20,8 @@ Use a local console/TTY and keep a recovery path available before starting: the 
 - sing-box runs in the namespace with a TUN using `auto_route` and `auto_redirect`. Its SOCKS outbound is bound to `lo` and connects to Xray; the VLESS server's IPv4 `/32` is excluded from TUN routing to avoid a routing loop. The SOCKS bridge is configured for TCP and UDP. Xray handles REALITY because newer Xray servers can be incompatible with sing-box's REALITY client ([sing-box issue #4520](https://github.com/SagerNet/sing-box/issues/4520)).
 - Before changing the host default route, the supervisor probes DNS over both TCP and UDP through the tunnel. This is a connectivity probe, not a test that arbitrary websites work.
 - The host gets routes for the configured Proton peer IPv4 addresses through the gateway, with blackhole fallbacks in both the main and dedicated endpoint policy tables. systemd-resolved is pointed at the configured DNS server on the tunnel link during default bootstrap. When a Proton handshake is observed, that setting is reverted and the app must supply working Proton DNS. IPv6 has a blackhole default policy while the service runs.
-- `outer-vpn.service` is `Type=notify`: one supervisor and both core processes stay in the same systemd cgroup. The cores' stdout/stderr are discarded. Supervisor messages are in English and do not print the VLESS URL or core configuration. Configuration, runtime files, and transaction backups contain sensitive data and must remain private.
-- Changes are journaled and file updates are atomic. Repeated install/apply/start/stop/uninstall operations are designed to be safe; failed file transactions roll back, and incomplete network cleanup retains the traffic guard for recovery.
+- `outer-vpn.service` is `Type=notify`: one supervisor and both core processes stay in the same systemd cgroup. Core stdout is discarded; a bounded stderr tail is redacted and reported if a core fails. Configuration, runtime files, and transaction backups contain sensitive data and must remain private.
+- Changes are journaled and file updates are atomic. Repeated install/apply/start/stop/uninstall operations are designed to be safe; failed file transactions roll back. A failed service retains its guard; an explicit `stop` attempts to remove owned guards even if another cleanup step reports an error.
 
 ## Requirements
 
@@ -75,9 +75,10 @@ Run commands from the repository directory. `preflight` and `dry-run` read the l
 # Unprivileged checks
 python3 outer.py preflight --env .env
 python3 outer.py dry-run --env .env
+sudo python3 outer.py debug-rules --env .env
 
 # Root-required installation and configuration
-sudo python3 outer.py install
+sudo python3 outer.py install --env .env
 sudo python3 outer.py apply --env .env
 
 # Start only while Proton is disconnected; then connect Proton using WireGuard UDP
@@ -92,9 +93,15 @@ sudo python3 outer.py stop
 sudo python3 outer.py uninstall
 ```
 
-`install` installs the unit and script but does not enable the service for boot or start it. If pinned binaries are absent or fail integrity checks, it asks before downloading official sing-box 1.14.4 and Xray 26.10.21 releases. It checks GitHub's official release metadata, exact asset URLs, and SHA-256 digests before installing. Answer `y`/`yes` to confirm; `sudo python3 outer.py install --yes` skips the prompt and explicitly authorizes the download. A current, verified installation does not download again. No tests download binaries.
+`install` reads `--env` (default `.env`) and checks the generated nftables scripts before downloading or installing files. It installs the unit and script but does not enable the service for boot or start it. If pinned binaries are absent or fail integrity checks, it asks before downloading official sing-box 1.14.4 and Xray 26.10.21 releases. It checks GitHub's official release metadata, exact asset URLs, and SHA-256 digests before installing. Answer `y`/`yes` to confirm; `sudo python3 outer.py install --yes` skips the prompt and explicitly authorizes the download. A current, verified installation does not download again. No tests download binaries.
+
+After updating an existing checkout, stop the gateway and run `sudo python3 outer.py install --env .env` again so systemd uses the updated supervisor. Applying `.env` again is safe if it is unchanged.
+
+`debug-rules` prints the nftables scripts and commands used by `outer.py`, including the route-selected physical interface. Dynamic Proton-peer examples use a configured endpoint and illustrative UDP port 51820; the live port is learned from WireGuard. It only performs read-only route and nftables inspection and does not install rules or change routes. Use `sudo` to inspect existing nftables tables. Review output before sharing it because interface names and network addresses are local details.
 
 `apply` validates the generated configs with the installed real binaries and copies `.env` into the root-only configuration path. `start` launches the single supervisor, which checks the outer connection before changing the host default route. Connect Proton only after `start` succeeds. With the default mode, websites and services can see the outer IP until Proton connects. Changing `.env` requires stopping first, applying the new file, then starting again; `apply` refuses to change a running configuration.
+
+Before installing files or changing networking, `install` and `start` check the generated nftables scripts with `nft -c`. Validation uses the actual route-selected interface and exercises transition, guard/NAT, peer-update and cleanup commands without committing them. It requires root/kernel access. On failure no gateway networking is changed; the existing connection, including any ordinary direct connection, remains as it was. The checks cover `outer.py`'s own nft scripts, not rules sing-box creates internally. A successful check is not proof of a working connection. System utilities, including nft and sysctl, are invoked by absolute path rather than the caller's `PATH`. External-command failures include redacted argv and stderr in the error and system journal; failures after a recovery journal is created are also recorded there. Review diagnostics for local addresses before sharing them.
 
 ## Legacy migration and backups
 
@@ -137,16 +144,19 @@ python3 -c 'import urllib.request; print(urllib.request.urlopen("https://api.ipi
 
 Do not send sensitive traffic during testing. If Proton disconnects after a handshake, outer-bootstrap access stays closed; the GUI may need Proton to reconnect without fresh API/DNS access. To deliberately return to bootstrap, stop and start the gateway only after securing/disconnecting ordinary network access: stopping removes the guard.
 
-If startup or the running service fails, the program attempts to retain a traffic guard rather than expose direct egress; the unit does not auto-restart. If nftables is missing or the guard cannot be installed, disconnect the network immediately because protection cannot be guaranteed. Inspect locally, then retry the journaled cleanup:
+After a failure during gateway setup or operation, a traffic guard may remain until explicit cleanup; the unit does not auto-restart. Failures before nftables validation completes leave networking as it was, without installing a new guard. Inspect locally, then retry the journaled cleanup:
 
 ```sh
 sudo python3 outer.py status
 sudo systemctl status outer-vpn.service --no-pager
 sudo journalctl -u outer-vpn.service -b --no-pager
+sudo journalctl -t outer-vpn -b --no-pager
 sudo python3 outer.py stop
 ```
 
-`stop` is the supported recovery path and is safe to retry. If legacy migration was interrupted before the new service became ready, it restores the saved legacy files and service state before releasing the guard; completed migrations are not undone. Do not flush nftables, delete routes, or remove the namespace manually while a recovery journal remains; that can defeat the guard. If `stop` still fails, preserve the guard and backups, correct the underlying service/tool problem, and retry from a local console. Once stop/uninstall completes, the guard is gone and ordinary host routing is restored; applications may then use the regular, non-Proton route.
+`stop` is the supported recovery path and is safe to retry. If legacy migration was interrupted before the new service became ready, it restores the saved legacy files and service state before releasing the guard; completed migrations are not undone. Do not flush nftables, delete routes, or remove the namespace manually while a recovery journal remains; that can defeat the guard. `stop` attempts to remove owned guards even if another rollback operation fails, and reports any remaining error; inspect `status` and retry from a local console. A guard with no recovery journal is reported as untracked and is not deleted automatically, because ownership cannot be established. Once stop/uninstall completes, the guard is gone and ordinary host routing is restored; applications may then use the regular, non-Proton route.
+
+After a failed `start`, run `sudo python3 outer.py status`, then `sudo python3 outer.py stop`, and inspect status again. The status reports actual nft guard tables separately from the recovery journal. Restored Internet access may use the ordinary, non-Proton route and expose the normal public IP. Runtime behavior on the reported nftables 1.1.6 laptop has not been verified. Test only from a local console or TTY—not over SSH—with network-using apps closed, Proton disconnected, and the recovery command ready.
 
 ## Tests
 
@@ -164,3 +174,4 @@ The tests cover VLESS/environment parsing, IPv4 endpoint validation, generated c
 - [sing-box TUN and auto-redirect](https://sing-box.sagernet.org/configuration/inbound/tun/)
 - [Xray VLESS and Vision UDP/443](https://xtls.github.io/en/config/outbounds/vless.html)
 - [Proton kill switch behavior](https://protonvpn.com/support/what-is-kill-switch)
+- [nftables manual and check mode](https://netfilter.org/projects/nftables/manpage.html)

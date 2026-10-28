@@ -28,8 +28,21 @@ class RecordingRunner:
             out = json.dumps([{"dev": self.route_dev}])
         return subprocess.CompletedProcess(args, 0, out, "")
 
+    def json(self, args):
+        return {"nftables": []}
+
 
 class RouteSafetyTests(unittest.TestCase):
+    def test_initial_waiting_state_does_not_reapply_an_unchanged_nft_set(self):
+        settings = {"interface": "proton0", "endpoints": ["198.51.100.10"], "dns": "1.1.1.1", "strict": False}
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = outer.Paths(Path(temporary))
+            state = {"version": 1, "phase": "running", "undo": [], "proton_latched": False}
+            runner = RecordingRunner()
+            with mock.patch.object(outer, "_proton_peers", return_value=()):
+                self.assertEqual(outer.update_proton_guard(state, settings, (), paths=paths, runner=runner), ())
+            self.assertFalse(any(args == ["nft", "-f", "-"] for args, _ in runner.calls))
+
     def test_wireguard_peer_requires_allowlisted_address_and_marked_veth_route(self):
         settings = {"interface": "proton0", "endpoints": ["198.51.100.10"]}
         good = RecordingRunner()

@@ -17,6 +17,7 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -24,8 +25,10 @@ import stat
 import struct
 import subprocess
 import sys
+import syslog
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -117,30 +120,132 @@ LEGACY_UNIT = "outer-gateway.service"
 MANAGED_MARKER = "# Managed by outer.py; changes may be replaced."
 
 
+SYSTEM_TOOLS = {
+    "ip": ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"),
+    "nft": ("/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"),
+    "sysctl": ("/usr/sbin/sysctl", "/sbin/sysctl", "/usr/bin/sysctl", "/bin/sysctl"),
+    "wg": ("/usr/bin/wg", "/usr/sbin/wg", "/bin/wg", "/sbin/wg"),
+    "systemctl": ("/usr/bin/systemctl", "/bin/systemctl"),
+    "resolvectl": ("/usr/bin/resolvectl", "/bin/resolvectl"),
+}
+
+
+def executable_path(name):
+    name = str(name)
+    if os.path.isabs(name):
+        return name
+    if name not in SYSTEM_TOOLS:
+        raise OuterError("An unrecognized external command was rejected.")
+    for candidate in SYSTEM_TOOLS[name]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise OuterError(f"Required system tool {name} was not found in trusted system directories.")
+
+
+def command_argv(args):
+    command = [str(arg) for arg in args]
+    if not command:
+        raise OuterError("An empty external command was rejected.")
+    command[0] = executable_path(command[0])
+    if Path(command[0]).name == "ip" and command[1:3] == ["netns", "exec"]:
+        if len(command) < 5:
+            raise OuterError("An incomplete namespace command was rejected.")
+        command[4] = executable_path(command[4])
+    return command
+
+
+def attempted_argv(args):
+    attempted = [str(arg) for arg in args]
+    if attempted and attempted[0] in SYSTEM_TOOLS:
+        attempted[0] = SYSTEM_TOOLS[attempted[0]][0]
+    if len(attempted) >= 5 and attempted[1:3] == ["netns", "exec"] and attempted[4] in SYSTEM_TOOLS:
+        attempted[4] = SYSTEM_TOOLS[attempted[4]][0]
+    return attempted
+
+
+def redact_text(value, secrets=()):
+    text = str(value or "")
+    for secret in sorted((str(item) for item in secrets if item and len(str(item)) >= 4),
+                         key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
+    text = re.sub(r"(?i)vless://[^\s\"']+", "[redacted VLESS URL]", text)
+    text = re.sub(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+                  "[redacted UUID]", text)
+    text = re.sub(
+        r"(?i)(\b(?:password|passwd|secret|token|private[_-]?key|public[_-]?key|short[_-]?id|spider[_-]?x|uuid|pbk|sid|spx)\b"
+        r"[\"']?\s*[:=]\s*[\"']?)([^\s\"',}\]]+)",
+        r"\1[redacted]", text,
+    )
+    text = "".join(ch if ch in "\n\t" or ord(ch) >= 32 and ord(ch) != 127 else "?" for ch in text)
+    if len(text) > 8192:
+        text = text[:8192] + "\n[stderr truncated]"
+    return text
+
+
+def command_failure(args, returncode, stderr, *, secrets=(), label="Command failed"):
+    safe_args = []
+    hide_next = False
+    for arg in map(str, args):
+        if hide_next:
+            safe_args.append("[redacted]")
+            hide_next = False
+        else:
+            safe_args.append(redact_text(arg, secrets))
+            hide_next = bool(re.fullmatch(r"(?i)--?(?:password|passwd|secret|token|uuid|pbk|private-key|public-key)", arg))
+    command = shlex.join(safe_args)
+    detail = redact_text(stderr, secrets).strip() or "(empty)"
+    code = f" (exit {returncode})" if returncode is not None else ""
+    return OuterError(f"{label}{code}.\nargv: {command}\nstderr: {detail}")
+
+
 class Runner:
+    def __init__(self):
+        self.secrets = set()
+
+    def add_secrets(self, *values):
+        self.secrets.update(str(value) for value in values if value)
+
     def run(self, args, *, input_text=None, check=True, timeout=30):
         env = os.environ.copy()
         env["LC_ALL"] = "C"
         try:
+            command = command_argv(args)
+        except OuterError as exc:
+            raise command_failure(attempted_argv(args), None, str(exc), secrets=self.secrets,
+                                  label="Could not resolve command") from exc
+        try:
             result = subprocess.run(
-                [str(x) for x in args], input=input_text, text=True,
+                command, input=input_text, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                 timeout=timeout, check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise OuterError(f"Could not run {Path(str(args[0])).name}.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise command_failure(command, None, exc.stderr, secrets=self.secrets,
+                                  label="Command timed out") from exc
+        except OSError as exc:
+            raise command_failure(command, None, exc.strerror or type(exc).__name__,
+                                  secrets=self.secrets, label="Could not run command") from exc
         if check and result.returncode:
-            raise OuterError(f"{Path(str(args[0])).name} failed (exit {result.returncode}).")
+            raise command_failure(command, result.returncode, result.stderr, secrets=self.secrets)
         return result
 
     def json(self, args):
+        result = self.run(args)
         try:
-            return json.loads(self.run(args).stdout)
+            return json.loads(result.stdout)
         except (ValueError, TypeError) as exc:
-            raise OuterError(f"{Path(str(args[0])).name} returned invalid data.") from exc
+            raise command_failure(getattr(result, "args", args), result.returncode, result.stderr,
+                                  secrets=self.secrets, label="Command returned invalid JSON") from exc
 
 
 RUNNER = Runner()
+
+
+def register_settings_secrets(settings, runner=RUNNER):
+    if hasattr(runner, "add_secrets"):
+        vless = settings.get("vless", {})
+        runner.add_secrets(vless.get("uuid"), vless.get("public_key"),
+                           vless.get("short_id"), vless.get("spider_x"))
 
 
 def require_root():
@@ -377,7 +482,12 @@ WantedBy=multi-user.target
 
 
 def systemd_active(runner=RUNNER, unit=UNIT_NAME):
-    return runner.run(["systemctl", "is-active", "--quiet", unit], check=False).returncode == 0
+    command = ["systemctl", "is-active", "--quiet", unit]
+    result = runner.run(command, check=False)
+    if result.returncode not in (0, 3, 4):
+        raise command_failure(getattr(result, "args", command), result.returncode, result.stderr,
+                              secrets=getattr(runner, "secrets", ()), label="Could not inspect service state")
+    return result.returncode == 0
 
 
 def systemd_enabled(runner=RUNNER, unit=UNIT_NAME):
@@ -986,7 +1096,7 @@ def installed_binary_integrity(paths=PATHS):
         return False
 
 
-def install(paths=PATHS, runner=RUNNER, *, confirmed=False, source=None):
+def install(paths=PATHS, runner=RUNNER, *, confirmed=False, source=None, env_path=".env"):
     require_root()
     source = Path(source or __file__).resolve()
     script = source.read_bytes()
@@ -1003,6 +1113,10 @@ def install(paths=PATHS, runner=RUNNER, *, confirmed=False, source=None):
         return
     if systemd_active(runner):
         raise OuterError("Stop the active gateway before changing its installation.")
+    settings = read_settings(env_path)
+    register_settings_secrets(settings, runner)
+    server = checked_server(settings)
+    prepare_nft_rules(settings, server, runner)
     if binaries_ok:
         sing, xray = paths.sing.read_bytes(), paths.xray.read_bytes()
     else:
@@ -1072,6 +1186,7 @@ def checked_server(settings):
 
 
 def validate_configs(settings, server, paths=PATHS, runner=RUNNER):
+    register_settings_secrets(settings, runner)
     if not installed_binary_integrity(paths):
         raise OuterError("Install verified sing-box and Xray binaries first.")
     with tempfile.TemporaryDirectory(prefix="outer-vpn-config-") as temporary:
@@ -1133,6 +1248,26 @@ def journal_action(state, undo, *, protected=False, kind="command", paths=PATHS)
     return item
 
 
+def journal_failure(state, error, *, paths=PATHS, runner=RUNNER):
+    message = redact_text(error, getattr(runner, "secrets", ()))
+    state["last_error"] = message
+    errors = state.setdefault("errors", [])
+    if not errors or errors[-1] != message:
+        errors.append(message)
+        del errors[:-10]
+    save_state(state, paths)
+    return message
+
+
+def log_failure(message, runner=RUNNER):
+    safe = redact_text(message, getattr(runner, "secrets", ()))
+    try:
+        syslog.openlog("outer-vpn", syslog.LOG_PID, syslog.LOG_DAEMON)
+        syslog.syslog(syslog.LOG_ERR, safe)
+    except OSError:
+        pass
+
+
 def _already_absent(result):
     message = result.stderr.lower()
     return any(phrase in message for phrase in (
@@ -1158,16 +1293,19 @@ def _undo_one(item, runner=RUNNER):
         if result.returncode:
             if _already_absent(result):
                 return
-            raise OuterError("An interface forwarding setting could not be restored.")
+            raise command_failure(getattr(result, "args", ["sysctl", "-n", key]), result.returncode, result.stderr,
+                                  secrets=getattr(runner, "secrets", ()), label="Could not restore forwarding")
         if result.stdout.strip() == "1" and previous != "1":
             runner.run(["sysctl", "-w", f"{key}={previous}"])
         return
     result = runner.run(value, check=False)
     if result.returncode and not _already_absent(result):
-        raise OuterError(f"Could not undo a {Path(str(value[0])).name} operation.")
+        args = getattr(result, "args", value)
+        raise command_failure(args, result.returncode, result.stderr,
+                              secrets=getattr(runner, "secrets", ()), label="Could not undo command")
 
 
-def cleanup(state=None, *, preserve_guard=False, paths=PATHS, runner=RUNNER):
+def cleanup(state=None, *, preserve_guard=False, preserve_journal=False, paths=PATHS, runner=RUNNER):
     preserve_guard = preserve_guard or (paths.runtime / "hold-guard").exists()
     state = state if state is not None else load_state(paths)
     if not state:
@@ -1182,21 +1320,23 @@ def cleanup(state=None, *, preserve_guard=False, paths=PATHS, runner=RUNNER):
             save_state(state, paths)
         except (OSError, OuterError) as exc:
             errors.append(str(exc))
-    if not errors and not preserve_guard:
+    if not preserve_guard:
         for item in reversed(state["undo"][:]):
+            if not item.get("protected"):
+                continue
             try:
                 _undo_one(item, runner)
                 state["undo"].remove(item)
                 save_state(state, paths)
             except (OSError, OuterError) as exc:
                 errors.append(str(exc))
-                break
     if errors:
         state["phase"] = "cleanup-incomplete"
-        save_state(state, paths)
-        raise OuterError("Cleanup was incomplete; the traffic guard remains in place. Run stop again.")
-    if state["undo"]:
-        state["phase"] = "failed-guarded"
+        detail = "\n".join(errors)
+        journal_failure(state, detail, paths=paths, runner=runner)
+        raise OuterError("Cleanup was incomplete; run stop again.\n" + detail)
+    if state["undo"] or preserve_journal:
+        state["phase"] = "cleanup-incomplete" if preserve_journal else "failed-guarded"
         save_state(state, paths)
     else:
         with contextlib.suppress(FileNotFoundError):
@@ -1210,7 +1350,11 @@ def cleanup(state=None, *, preserve_guard=False, paths=PATHS, runner=RUNNER):
 
 def _action(state, command, undo, *, protected=False, kind="command", paths=PATHS, runner=RUNNER, input_text=None):
     journal_action(state, undo, protected=protected, kind=kind, paths=paths)
-    runner.run(command, input_text=input_text)
+    try:
+        runner.run(command, input_text=input_text)
+    except OuterError as exc:
+        journal_failure(state, str(exc), paths=paths, runner=runner)
+        raise
 
 
 def _transition_script():
@@ -1228,6 +1372,11 @@ def _nft_tables(runner=RUNNER):
     data = runner.json(["nft", "-j", "list", "tables"])
     return {(entry["table"]["family"], entry["table"]["name"])
             for entry in data.get("nftables", []) if "table" in entry}
+
+
+def _active_guards(runner=RUNNER):
+    return sorted(name for family, name in _nft_tables(runner)
+                  if family == "inet" and name in ("outer_vpn_transition", "outer_vpn_guard"))
 
 
 def add_transition(state, paths=PATHS, runner=RUNNER):
@@ -1288,6 +1437,17 @@ def _route_prefix(route):
         return None
 
 
+def detect_outer_route(server, interface, runner=RUNNER):
+    selection = runner.json(["ip", "-j", "-4", "route", "get", server])
+    if not selection or not selection[0].get("dev"):
+        raise OuterError("No physical IPv4 route to the outer server is available.")
+    selected = selection[0]
+    device = validate_interface(selected["dev"])
+    if device == interface or device.startswith(("proton", "pvpn")):
+        raise OuterError("The outer server currently routes through Proton; disconnect it before starting.")
+    return selected
+
+
 def network_inventory(server, endpoints, interface, runner=RUNNER):
     names = runner.run(["ip", "netns", "list"]).stdout.splitlines()
     if any(line.split()[0] == NAMESPACE for line in names if line.split()):
@@ -1306,7 +1466,9 @@ def network_inventory(server, endpoints, interface, runner=RUNNER):
         result = runner.run(["ip", "-j", family, "route", "show", "table", table], check=False)
         if result.returncode:
             if "table does not exist" not in result.stderr.lower() and "no such" not in result.stderr.lower():
-                raise OuterError("A reserved routing table could not be inspected.")
+                raise command_failure(getattr(result, "args", ["ip", "-j", family, "route", "show", "table", table]),
+                                      result.returncode, result.stderr, secrets=getattr(runner, "secrets", ()),
+                                      label="Could not inspect routing table")
         elif json.loads(result.stdout or "[]"):
             raise OuterError("A reserved routing table is already in use.")
     routes = runner.json(["ip", "-j", "-4", "route", "show", "table", "main"])
@@ -1329,13 +1491,8 @@ def network_inventory(server, endpoints, interface, runner=RUNNER):
         device = route.get("dev", "")
         if device == interface or device.startswith(("proton", "pvpn")):
             raise OuterError("A Proton route is active; connect Proton only after the outer gateway starts.")
-    selection = runner.json(["ip", "-j", "-4", "route", "get", server])
-    if not selection or not selection[0].get("dev"):
-        raise OuterError("No physical IPv4 route to the outer server is available.")
-    selected = selection[0]
-    device = validate_interface(selected["dev"])
-    if device == interface or device.startswith(("proton", "pvpn")):
-        raise OuterError("The outer server currently routes through Proton; disconnect it before starting.")
+    selected = detect_outer_route(server, interface, runner)
+    device = selected["dev"]
     outer_routes = [route for route in routes if _route_prefix(route) == ipaddress.IPv4Network(f"{server}/32")]
     if outer_routes and any(route.get("dev") != device or route.get("gateway") != selected.get("gateway") for route in outer_routes):
         raise OuterError("An existing outer-server host route conflicts with the gateway.")
@@ -1374,6 +1531,85 @@ table ip outer_vpn_nat {{
   }}
 }}
 '''
+
+
+def _proton_guard_script(settings, peers, latched):
+    script = ("flush set inet outer_vpn_guard proton_ifaces\n"
+              "flush set inet outer_vpn_guard proton_peers\n"
+              "flush set inet outer_vpn_guard bootstrap_ifaces\n")
+    if not latched and not settings.get("strict", False):
+        script += f'add element inet outer_vpn_guard bootstrap_ifaces {{ "{HOST_IF}" }}\n'
+    if peers:
+        elements = ", ".join(f"{address} . {port}" for address, port in peers)
+        script += f'add element inet outer_vpn_guard proton_peers {{ {elements} }}\n'
+        script += f'add element inet outer_vpn_guard proton_ifaces {{ "{settings["interface"]}" }}\n'
+    return script
+
+
+def nft_rule_plan(settings, server, physical):
+    guard = _guard_script(settings, server, physical)
+    peer = ((settings["endpoints"][0], 51820),)
+    updates = [
+        ("waiting for Proton", _proton_guard_script(settings, (), False)),
+        ("peer configured", _proton_guard_script(settings, peer, False)),
+        ("Proton connected", _proton_guard_script(settings, peer, True)),
+        ("Proton disconnected", _proton_guard_script(settings, (), True)),
+    ]
+    checks = [("transition", _transition_script()), ("guard and NAT", guard)]
+    checks.extend((label, guard + script) for label, script in updates)
+    checks.append(("transition deletion", _transition_script() +
+                   "delete table inet outer_vpn_transition\n"))
+    checks.append(("guard and NAT deletion", guard +
+                   "delete table inet outer_vpn_guard\ndelete table ip outer_vpn_nat\n"))
+    return {"checks": checks, "transition": _transition_script(), "guard": guard, "updates": updates}
+
+
+def validate_nft_rules(settings, server, physical, runner=RUNNER):
+    for label, script in nft_rule_plan(settings, server, physical)["checks"]:
+        try:
+            runner.run(["nft", "-c", "-f", "-"], input_text=script)
+        except OuterError as exc:
+            raise OuterError(f"nft pre-validation failed for {label}:\n{exc}") from exc
+
+
+def prepare_nft_rules(settings, server, runner=RUNNER):
+    route = detect_outer_route(server, settings["interface"], runner)
+    reserved = {("inet", "outer_vpn_transition"), ("inet", "outer_vpn_guard"),
+                ("ip", "outer_vpn_nat")}
+    if _nft_tables(runner) & reserved:
+        raise OuterError("A reserved nftables table already exists; inspect status before starting.")
+    validate_nft_rules(settings, server, route["dev"], runner)
+    return route["dev"]
+
+
+def debug_rules(env_path, runner=RUNNER):
+    settings = read_settings(env_path)
+    register_settings_secrets(settings, runner)
+    server = checked_server(settings)
+    route = detect_outer_route(server, settings["interface"], runner)
+    physical = route["dev"]
+    plan = nft_rule_plan(settings, server, physical)
+    nft = executable_path("nft")
+    print(f"Detected outer-server interface: {physical}")
+    print("Only read-only inspection was performed; no network settings were changed.")
+    print("Peer-update examples use a configured endpoint and illustrative UDP port 51820.")
+    try:
+        tables = _nft_tables(runner)
+        present = sorted(name for family, name in tables if (family, name) in {
+            ("inet", "outer_vpn_transition"), ("inet", "outer_vpn_guard"), ("ip", "outer_vpn_nat")})
+        print("Existing reserved tables: " + (", ".join(present) if present else "none"))
+    except OuterError as exc:
+        print(f"Existing reserved tables: unknown ({exc})")
+    print("\n# Inspect existing tables\n" + shlex.join([nft, "-j", "list", "tables"]))
+    for label, script in plan["checks"]:
+        print(f"\n# Read-only validation: {label}\n" + shlex.join([nft, "-c", "-f", "-"]))
+        print(script, end="" if script.endswith("\n") else "\n")
+    for label, script in [("transition", plan["transition"]), ("guard and NAT", plan["guard"]), *plan["updates"]]:
+        print(f"\n# Apply: {label}\n" + shlex.join([nft, "-f", "-"]))
+        print(script, end="" if script.endswith("\n") else "\n")
+    for family, name in (("inet", "outer_vpn_transition"), ("ip", "outer_vpn_nat"),
+                         ("inet", "outer_vpn_guard")):
+        print("\n# Remove owned table\n" + shlex.join([nft, "delete", "table", family, name]))
 
 
 def _set_forwarding(state, interface, *, paths=PATHS, runner=RUNNER):
@@ -1528,11 +1764,70 @@ def notify_systemd(message):
         raise OuterError("Could not notify systemd of gateway readiness.") from exc
 
 
+class CoreProcess:
+    def __init__(self, process, command):
+        self.process = process
+        self.command = command
+        self.stderr_tail = bytearray()
+        self.stderr_truncated = False
+        self.lock = threading.Lock()
+        self.reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self.reader.start()
+
+    def _read_stderr(self):
+        try:
+            while True:
+                chunk = self.process.stderr.read(4096)
+                if not isinstance(chunk, bytes) or not chunk:
+                    return
+                with self.lock:
+                    self.stderr_tail.extend(chunk)
+                    if len(self.stderr_tail) > 8192:
+                        del self.stderr_tail[:-8192]
+                        self.stderr_truncated = True
+        except (OSError, ValueError):
+            return
+
+    def poll(self):
+        return self.process.poll()
+
+    def terminate(self):
+        return self.process.terminate()
+
+    def kill(self):
+        return self.process.kill()
+
+    def wait(self, timeout=None):
+        result = self.process.wait(timeout=timeout)
+        self.reader.join(timeout=1)
+        return result
+
+    def failure(self, label, runner=RUNNER):
+        self.reader.join(timeout=1)
+        with self.lock:
+            stderr = bytes(self.stderr_tail)
+            if self.stderr_truncated:
+                _, separator, remainder = stderr.partition(b"\n")
+                stderr = b"[earlier stderr omitted]\n" + (remainder if separator else b"")
+            stderr = stderr.decode("utf-8", errors="replace")
+        return command_failure(self.command, self.poll(), stderr, secrets=getattr(runner, "secrets", ()), label=label)
+
+
 def _spawn_core(args):
     env = os.environ.copy()
     env["LC_ALL"] = "C"
-    return subprocess.Popen([str(arg) for arg in args], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    try:
+        command = command_argv(args)
+    except OuterError as exc:
+        raise command_failure(attempted_argv(args), None, str(exc), secrets=RUNNER.secrets,
+                              label="Could not resolve command") from exc
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+        return CoreProcess(process, command)
+    except OSError as exc:
+        raise command_failure(command, None, exc.strerror or type(exc).__name__,
+                              secrets=RUNNER.secrets, label="Could not start command") from exc
 
 
 def _stop_cores(children):
@@ -1629,15 +1924,7 @@ def update_proton_guard(state, settings, previous, *, paths=PATHS, runner=RUNNER
     latched = bool(state.get("proton_latched")) or handshake
     if peers == previous and latched == bool(state.get("proton_latched")):
         return previous
-    script = ("flush set inet outer_vpn_guard proton_ifaces\n"
-              "flush set inet outer_vpn_guard proton_peers\n"
-              "flush set inet outer_vpn_guard bootstrap_ifaces\n")
-    if not latched and not settings.get("strict", False):
-        script += f'add element inet outer_vpn_guard bootstrap_ifaces {{ "{HOST_IF}" }}\n'
-    if peers:
-        elements = ", ".join(f"{address} . {port}" for address, port in peers)
-        script += f'add element inet outer_vpn_guard proton_peers {{ {elements} }}\n'
-        script += f'add element inet outer_vpn_guard proton_ifaces {{ "{settings["interface"]}" }}\n'
+    script = _proton_guard_script(settings, peers, latched)
     runner.run(["nft", "-f", "-"], input_text=script)
     if latched:
         runner.run(["resolvectl", "revert", HOST_IF])
@@ -1660,17 +1947,22 @@ def update_proton_guard(state, settings, previous, *, paths=PATHS, runner=RUNNER
 
 
 def dependencies_ok(runner=RUNNER):
-    missing = [name for name in ("ip", "nft", "systemctl", "resolvectl", "sysctl", "wg") if shutil.which(name) is None]
+    missing = [name for name, paths in SYSTEM_TOOLS.items()
+               if not any(os.path.isfile(path) and os.access(path, os.X_OK) for path in paths)]
     if missing:
         raise OuterError("Missing required system tools: " + ", ".join(missing) + ".")
     if not Path("/dev/net/tun").exists():
         raise OuterError("The TUN device is unavailable; load the tun kernel module first.")
-    if runner.run(["systemctl", "is-active", "--quiet", "systemd-resolved.service"], check=False).returncode:
-        raise OuterError("systemd-resolved must be running.")
+    command = ["systemctl", "is-active", "--quiet", "systemd-resolved.service"]
+    result = runner.run(command, check=False)
+    if result.returncode:
+        raise command_failure(getattr(result, "args", command), result.returncode, result.stderr,
+                              secrets=getattr(runner, "secrets", ()), label="systemd-resolved must be running")
 
 
 def preflight(env_path, paths=PATHS, runner=RUNNER):
     settings = read_settings(env_path)
+    register_settings_secrets(settings, runner)
     server = checked_server(settings)
     dependencies_ok(runner)
     if installed_binary_integrity(paths):
@@ -1706,6 +1998,7 @@ def _make_state(settings, server, env_bytes, paths=PATHS):
 def supervise(paths=PATHS, runner=RUNNER):
     require_root()
     settings, env_bytes = read_settings_and_data(paths.env)
+    register_settings_secrets(settings, runner)
     state = load_state(paths)
     if state:
         if state.get("phase") != "transition" or state.get("env_sha256") != hashlib.sha256(env_bytes).hexdigest():
@@ -1717,7 +2010,10 @@ def supervise(paths=PATHS, runner=RUNNER):
         dependencies_ok(runner)
         server = checked_server(settings)
         validate_configs(settings, server, paths, runner)
+        physical = prepare_nft_rules(settings, server, runner)
         state = _make_state(settings, server, env_bytes, paths)
+        state["validated_physical"] = physical
+        save_state(state, paths)
         add_transition(state, paths, runner)
     children = []
     stopping = False
@@ -1732,14 +2028,17 @@ def supervise(paths=PATHS, runner=RUNNER):
     old_int = signal.signal(signal.SIGINT, on_signal)
     try:
         inventory = network_inventory(server, settings["endpoints"], settings["interface"], runner)
+        if state.get("validated_physical") and inventory["physical"] != state["validated_physical"]:
+            raise OuterError("The outer-server interface changed after nft validation; run stop and retry.")
         _network_before_cores(state, settings, server, inventory, paths, runner)
         children.append(_spawn_core(["ip", "netns", "exec", NAMESPACE, paths.xray, "run", "-config", paths.runtime / "xray.json"]))
         children.append(_spawn_core(["ip", "netns", "exec", NAMESPACE, paths.sing, "run", "-c", paths.runtime / "sing-box.json"]))
         for _ in range(80):
             if stopping:
                 break
-            if any(child.poll() is not None for child in children):
-                raise OuterError("A tunnel core stopped before it was ready.")
+            for child in children:
+                if child.poll() is not None:
+                    raise child.failure("A tunnel core stopped before it was ready", runner)
             tun = runner.run(["ip", "-n", NAMESPACE, "link", "show", "dev", TUN_IF], check=False)
             socks = runner.run(["ip", "netns", "exec", NAMESPACE, sys.executable, paths.script, "_socks-ready"], check=False, timeout=3)
             if tun.returncode == 0 and socks.returncode == 0:
@@ -1752,18 +2051,20 @@ def supervise(paths=PATHS, runner=RUNNER):
             _network_after_probe(state, settings, inventory, paths, runner)
             state["phase"] = "running"
             save_state(state, paths)
-            previous = update_proton_guard(state, settings, None, paths=paths, runner=runner)
+            previous = update_proton_guard(state, settings, (), paths=paths, runner=runner)
             drop_transition(state, paths, runner)
             notify_systemd("READY=1\nSTATUS=Outer gateway ready; waiting for verified Proton WireGuard")
             ready = True
             while not stopping:
-                if any(child.poll() is not None for child in children):
-                    raise OuterError("A tunnel core stopped unexpectedly; traffic remains blocked.")
+                for child in children:
+                    if child.poll() is not None:
+                        raise child.failure("A tunnel core stopped unexpectedly; traffic remains blocked", runner)
                 previous = update_proton_guard(state, settings, previous, paths=paths, runner=runner)
                 time.sleep(1)
     except (OuterError, OSError, ValueError) as exc:
         failed = True
-        print(f"Gateway error: {exc}", file=sys.stderr, flush=True)
+        message = journal_failure(state, str(exc), paths=paths, runner=runner)
+        print(f"Gateway error: {message}", file=sys.stderr, flush=True)
     finally:
         _stop_cores(children)
         try:
@@ -1812,25 +2113,19 @@ def start(paths=PATHS, runner=RUNNER):
         return
     if load_state(paths):
         raise OuterError("A previous gateway run left a recovery guard; run stop before starting again.")
-    try:
-        dependencies_ok(runner)
-        settings, env_bytes = read_settings_and_data(paths.env)
-        server = checked_server(settings)
-        validate_configs(settings, server, paths, runner)
-    except BaseException as exc:
-        try:
-            state = _make_state({}, "", b"", paths)
-            add_transition(state, paths, runner)
-            state["phase"] = "failed-guarded"
-            save_state(state, paths)
-        except (OuterError, OSError):
-            raise OuterError("Start failed and the traffic guard could not be installed; disconnect the network.") from exc
-        raise OuterError("Start failed; direct traffic is blocked. Run stop to release the guard.") from exc
+    dependencies_ok(runner)
+    settings, env_bytes = read_settings_and_data(paths.env)
+    register_settings_secrets(settings, runner)
+    server = checked_server(settings)
+    validate_configs(settings, server, paths, runner)
+    physical = prepare_nft_rules(settings, server, runner)
     legacy = legacy_paths(paths)
     was_active = systemd_active(runner, LEGACY_UNIT)
     was_enabled = systemd_enabled(runner, LEGACY_UNIT) if legacy or was_active else ""
     tx = None
     state = _make_state(settings, server, env_bytes, paths)
+    state["validated_physical"] = physical
+    save_state(state, paths)
     try:
         add_transition(state, paths, runner)
         if legacy or was_active:
@@ -1851,6 +2146,12 @@ def start(paths=PATHS, runner=RUNNER):
         if tx:
             _finish_migration(tx, "committed")
     except BaseException as exc:
+        failure_state = load_state(paths) or state
+        cause = failure_state.get("last_error") or redact_text(exc, getattr(runner, "secrets", ()))
+        service_error = redact_text(exc, getattr(runner, "secrets", ()))
+        if service_error and service_error != cause:
+            cause += "\nService manager: " + service_error
+        journal_failure(failure_state, cause, paths=paths, runner=runner)
         atomic_write(paths.runtime / "hold-guard", b"hold\n", 0o600)
         with contextlib.suppress(OuterError):
             runner.run(["systemctl", "stop", UNIT_NAME], check=False, timeout=60)
@@ -1873,8 +2174,8 @@ def start(paths=PATHS, runner=RUNNER):
             except (OuterError, OSError):
                 restored = False
         if restored and was_active:
-            raise OuterError("Start failed; the previous legacy gateway was restored.") from exc
-        raise OuterError("Start failed; a traffic guard remains in place. Run stop to release it.") from exc
+            raise OuterError("Start failed; the previous legacy gateway was restored.\n" + cause) from exc
+        raise OuterError("Start failed; run stop to clean up gateway changes.\n" + cause) from exc
     if tx:
         print(f"Legacy gateway migrated. Backup: {tx.directory}")
     print("Outer gateway started. Connect Proton WireGuard using an allowlisted endpoint.")
@@ -1884,6 +2185,10 @@ def stop(paths=PATHS, runner=RUNNER):
     require_root()
     state = load_state(paths)
     if not lexists(paths.unit) and not state:
+        guards = _active_guards(runner)
+        if guards:
+            raise OuterError("A gateway guard exists without a recovery journal; it was not removed: " +
+                             ", ".join(guards) + ".")
         print("Gateway is already stopped.")
         return
     pending = _pending_migration(state, paths)
@@ -1896,35 +2201,79 @@ def stop(paths=PATHS, runner=RUNNER):
     if result.returncode:
         inactive = runner.run(["systemctl", "is-active", "--quiet", UNIT_NAME], check=False)
         if inactive.returncode not in (3, 4):
-            raise OuterError("The service could not be stopped; the traffic guard was not removed.")
+            args = getattr(result, "args", ["systemctl", "stop", UNIT_NAME])
+            detail = command_failure(args, result.returncode, result.stderr,
+                                     secrets=getattr(runner, "secrets", ()), label="Could not stop service")
+            raise OuterError(f"The traffic guard was not removed.\n{detail}")
     if pending:
-        cleanup(preserve_guard=True, paths=paths, runner=runner)
+        try:
+            cleanup(preserve_guard=True, paths=paths, runner=runner)
+        except (OuterError, OSError):
+            pass
         tx, legacy = pending
-        _restore_migration(tx, legacy["active"], legacy["enabled"], paths, runner)
-        _finish_migration(tx, "rolled back")
-        print(f"Interrupted legacy migration restored. Backup: {tx.directory}")
+        try:
+            _restore_migration(tx, legacy["active"], legacy["enabled"], paths, runner)
+            _finish_migration(tx, "rolled back")
+        except (OuterError, OSError) as exc:
+            migration_error = redact_text(exc, getattr(runner, "secrets", ()))
+        else:
+            migration_error = None
+            print(f"Interrupted legacy migration restored. Backup: {tx.directory}")
+    else:
+        migration_error = None
     (paths.runtime / "hold-guard").unlink(missing_ok=True)
-    cleanup(paths=paths, runner=runner)
+    try:
+        cleanup(preserve_journal=bool(migration_error), paths=paths, runner=runner)
+    except (OuterError, OSError) as exc:
+        if migration_error:
+            raise OuterError(f"Legacy migration recovery failed: {migration_error}\n{exc}") from exc
+        raise
+    if migration_error:
+        state = load_state(paths)
+        if state:
+            journal_failure(state, migration_error, paths=paths, runner=runner)
+        raise OuterError(f"Legacy migration recovery failed; retry stop.\n{migration_error}")
+    guards = _active_guards(runner)
+    if guards:
+        raise OuterError("A gateway guard remains without a matching cleanup action; it was not removed: " +
+                         ", ".join(guards) + ".")
     print("Gateway stopped; its traffic guard was removed.")
 
 
 def status(paths=PATHS, runner=RUNNER):
-    active = systemd_active(runner)
-    print("Gateway service: " + ("active" if active else "inactive"))
+    try:
+        active = systemd_active(runner)
+    except OuterError as exc:
+        active = False
+        print(f"Gateway service: unknown ({exc})")
+    else:
+        print("Gateway service: " + ("active" if active else "inactive"))
+    state = None
     try:
         state = load_state(paths)
     except PermissionError:
-        print("Run status with sudo to inspect the traffic guard.")
-        return
+        print("Recovery journal: inaccessible; run status with sudo.")
+    except OuterError as exc:
+        print(f"Recovery journal: invalid ({exc})")
+    else:
+        print("Recovery journal: " + ("present" if state else "not present"))
+    try:
+        guards = _active_guards(runner)
+    except OuterError as exc:
+        print(f"Gateway traffic guard: unknown ({exc})")
+    else:
+        print("Gateway traffic guard: " + ("present (" + ", ".join(guards) + ")" if guards else "not present"))
+        if guards and not state:
+            print("Warning: the guard has no readable recovery journal; no unowned tables will be removed.")
     if state:
         print("Gateway state: " + str(state.get("phase", "unknown")))
+        if state.get("last_error"):
+            print("Last gateway error: " + redact_text(state["last_error"], getattr(runner, "secrets", ())))
         verified = active and state.get("phase") == "running" and state.get("proton_ready")
         print("Proton WireGuard: " + ("verified" if verified else "not verified"))
         if active and state.get("phase") == "running":
             mode = "Proton only" if state.get("proton_latched") or state.get("strict_mode") else "outer bootstrap"
             print("Traffic mode: " + mode)
-    else:
-        print("Gateway traffic guard: not present in the recovery journal")
 
 
 def uninstall(paths=PATHS, runner=RUNNER):
@@ -1966,11 +2315,12 @@ def uninstall(paths=PATHS, runner=RUNNER):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Manage a fail-closed outer VLESS gateway.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("preflight", "dry-run", "apply"):
+    for command in ("preflight", "dry-run", "debug-rules", "apply"):
         child = sub.add_parser(command)
         child.add_argument("--env", default=".env", help="data-only configuration file (default: .env)")
     install_parser = sub.add_parser("install")
     install_parser.add_argument("--yes", action="store_true", help="confirm official release downloads")
+    install_parser.add_argument("--env", default=".env", help="data-only configuration file (default: .env)")
     for command in ("start", "stop", "status", "uninstall", "_supervise", "_post-stop", "_socks-ready"):
         sub.add_parser(command, help=argparse.SUPPRESS if command.startswith("_") else None)
     probe = sub.add_parser("_probe", help=argparse.SUPPRESS)
@@ -1981,6 +2331,8 @@ def main(argv=None):
             preflight(args.env)
         elif args.command == "dry-run":
             dry_run(args.env)
+        elif args.command == "debug-rules":
+            debug_rules(args.env)
         elif args.command == "_probe":
             probe_tunnel(args.dns)
         elif args.command == "_socks-ready":
@@ -1996,7 +2348,7 @@ def main(argv=None):
             require_root()
             with operation_lock():
                 if args.command == "install":
-                    install(confirmed=args.yes)
+                    install(confirmed=args.yes, env_path=args.env)
                 elif args.command == "apply":
                     apply_config(args.env)
                 elif args.command == "start":
@@ -2007,7 +2359,9 @@ def main(argv=None):
                     uninstall()
         return 0
     except (OuterError, ValueError, OSError, json.JSONDecodeError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        message = redact_text(exc, RUNNER.secrets)
+        print(f"Error: {message}", file=sys.stderr)
+        log_failure(message)
         return 1
 
 
